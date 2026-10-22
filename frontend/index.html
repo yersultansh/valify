@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VALIFY - Asset Valuation Agent</title>
+<meta name="description" content="Исследовательский AI-прототип предварительной оценки цен предложения квартир в Алматы для финансово-банковского сектора.">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <p class="eyebrow">AI for Finance <span aria-hidden="true">/</span> Исследовательский прототип</p>
+  <h1>VALIFY</h1>
+  <p class="subtitle">Asset Valuation Agent</p>
+  <p class="intro">Машинное обучение для оценки ориентировочной цены предложения квартиры в Алматы. Дополнительный ориентир при предварительном анализе недвижимости, предлагаемой в обеспечение кредита.</p>
+  <div class="refresh"><button id="refresh" type="button">Обновить данные</button>
+    <span id="refresh-status" class="status" role="status" aria-live="polite"></span></div>
+</header>
+
+<main class="layout">
+  <form id="form" class="panel" novalidate>
+    <h2>Характеристики объекта недвижимости</h2>
+    <div class="field"><label for="district">Район</label>
+      <select id="district" aria-describedby="district-error" name="district" required><option value="">Загрузка…</option></select>
+      <span id="district-error" class="err" data-for="district"></span></div>
+    <div class="field"><label for="area_total">Общая площадь, м²</label>
+      <input id="area_total" aria-describedby="area_total-error" name="area_total" type="number" step="0.1" inputmode="decimal" required>
+      <span id="area_total-error" class="err" data-for="area_total"></span></div>
+    <div class="row">
+      <div class="field"><label for="floor">Этаж</label>
+        <input id="floor" aria-describedby="floor-error" name="floor" type="number" step="1" inputmode="numeric" required>
+        <span id="floor-error" class="err" data-for="floor"></span></div>
+      <div class="field"><label for="floor_total">Этажей в доме</label>
+        <input id="floor_total" aria-describedby="floor_total-error" name="floor_total" type="number" step="1" inputmode="numeric" required>
+        <span id="floor_total-error" class="err" data-for="floor_total"></span></div>
+    </div>
+    <div class="field"><label for="house_year">Год постройки</label>
+      <input id="house_year" aria-describedby="house_year-error" name="house_year" type="number" step="1" inputmode="numeric" required>
+      <span id="house_year-error" class="err" data-for="house_year"></span></div>
+    <div class="field"><label for="building_type">Тип дома</label>
+      <select id="building_type" aria-describedby="building_type-error" name="building_type" required><option value="">Загрузка…</option></select>
+      <span id="building_type-error" class="err" data-for="building_type"></span></div>
+    <fieldset><legend>Состояние отделки</legend>
+      <div class="radio">
+        <label><input type="radio" name="renovation" value="0"> Черновая отделка</label>
+        <label><input type="radio" name="renovation" value="1" checked> Другое</label>
+      </div></fieldset>
+    <button id="submit" type="submit">Получить предварительную оценку</button>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+  </form>
+
+  <div class="analysis-column">
+  <section id="result" class="panel" aria-live="polite" hidden>
+    <div id="alert" class="alert" role="alert" hidden></div>
+    <div id="output" hidden>
+      <p class="label">Ориентировочная цена предложения квартиры</p>
+      <p id="price" class="price"></p>
+      <p class="range-label">Ориентировочный диапазон цены предложения</p>
+      <div class="range" aria-hidden="true"><span id="marker"></span></div>
+      <p class="bounds"><span id="low"></span><span id="high"></span></p>
+      <p class="result-note">Результат основан на опубликованных ценах объявлений Krisha.kz и предназначен для предварительного анализа недвижимости. Диапазон не гарантирует цену конкретного объекта.</p>
+      <dl class="facts">
+        <div><dt>Цена за м²</dt><dd id="ppm2"></dd></div>
+        <div><dt>Медиана района за м²</dt><dd id="median"></dd></div>
+        <div><dt>К медиане района</dt><dd id="diff"></dd></div>
+      </dl>
+      <p><span id="badge" class="badge"></span> <span id="rows" class="muted"></span></p>
+      <ul id="warnings" class="warnings"></ul>
+      <h3 id="comparables-heading">Сопоставимые рыночные предложения</h3>
+      <p class="muted">Объявления со схожими характеристиками используются для дополнительного сравнения с рынком Алматы.</p>
+      <div class="scroll" tabindex="0" role="region" aria-labelledby="comparables-heading"><table>
+        <thead><tr><th>Цена</th><th>Площадь</th><th>Этаж</th><th>Год</th><th>Район</th><th>Объявление</th></tr></thead>
+        <tbody id="comps"></tbody>
+      </table></div>
+      <p id="quality" class="muted"></p>
+    </div>
+  </section>
+  <section class="panel bank-use" aria-labelledby="bank-use-heading">
+    <p class="eyebrow">Предлагаемое применение</p>
+    <h2 id="bank-use-heading">Как инструмент может использоваться банками</h2>
+    <ol class="bank-steps">
+      <li><strong>Характеристики объекта</strong><p>Кредитный специалист вводит параметры квартиры, предлагаемой в обеспечение кредита.</p></li>
+      <li><strong>Предварительный ориентир</strong><p>Приложение оценивает цену предложения на основе доступных рыночных данных.</p></li>
+      <li><strong>Сравнение с рынком</strong><p>Сотрудник получает ориентировочный диапазон, районную медиану и сопоставимые объявления.</p></li>
+      <li><strong>Дальнейшая проверка</strong><p>Результат помогает при предварительном рассмотрении объекта и определении необходимости дополнительной проверки.</p></li>
+    </ol>
+    <p class="prototype-note">Предлагаемый сценарий использования: интеграция с банками не реализована. Приложение не принимает решений об одобрении кредита.</p>
+  </section>
+  </div>
+</main>
+
+<footer class="foot">
+  <h2>Границы применения</h2>
+  <p>VALIFY — аналитический инструмент предварительной оценки. Прогноз строится на ценах объявлений, которые могут отличаться от фактических цен сделок. Результат не является официальным отчётом об оценке недвижимости, не устанавливает стоимость залога и не заменяет профессиональную оценку и процедуры банка.</p>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

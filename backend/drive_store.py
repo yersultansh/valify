@@ -1,0 +1,192 @@
+"""Storage back-ends for the batch collector: Google Drive API or a local folder.
+
+Both classes share the same tiny interface used by ``backend.batch``:
+
+    prepare() -> str            ensure the output folder exists, return its location
+    read(name) -> bytes | None  read a file from that folder (None if missing)
+    write(name, data: bytes)    create or update a file (never creates duplicates)
+
+Safety rules (PROJECT_INSTRUCTIONS.md, section 13):
+- Files are only looked up *inside* the output folder, by exact name.
+- Nothing is ever deleted or trashed. Unrelated files in the parent folder
+  (keys, notes, ...) are never listed, read or modified: the parent is only
+  searched for *folders*.
+- Files are uploaded as plain files (no conversion to Google Sheets/Docs).
+"""
+from __future__ import annotations
+
+import io
+import logging
+import os
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# Full Drive scope is required to find the EXISTING 'Forecasting' folder. The
+# narrower 'drive.file' scope only sees files this app created itself.
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+FOLDER_MIME = "application/vnd.google-apps.folder"
+_MIME_BY_SUFFIX = {".csv": "text/csv", ".txt": "text/plain", ".json": "application/json"}
+
+
+class StoreError(RuntimeError):
+    """Raised for setup problems (missing credentials, bad config, ...)."""
+
+
+# --------------------------------------------------------------------------
+# Local folder (e.g. a "Google Drive for desktop" synced directory)
+# --------------------------------------------------------------------------
+class LocalStore:
+    def __init__(self, directory: str | Path):
+        self.dir = Path(directory).expanduser()
+
+    def prepare(self) -> str:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        return str(self.dir)
+
+    def read(self, name: str) -> bytes | None:
+        p = self.dir / name
+        return p.read_bytes() if p.exists() else None
+
+    def write(self, name: str, data: bytes) -> None:
+        tmp = self.dir / (name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, self.dir / name)           # atomic on the same volume
+
+
+# --------------------------------------------------------------------------
+# Google Drive API
+# --------------------------------------------------------------------------
+def _media(data: bytes, mime: str):
+    """Upload payload for the Drive API (google-api-python-client is imported lazily; only STORE_BACKEND=drive needs it)."""
+    from googleapiclient.http import MediaIoBaseUpload
+    return MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+
+
+class DriveStore:
+    def __init__(self, parent_name: str, output_path: str, credentials_file: str | Path,
+                 token_file: str | Path, service=None):
+        self.parent_name = parent_name
+        self.segments = [s for s in output_path.replace("\\", "/").split("/") if s]
+        self.credentials_file = Path(credentials_file)
+        self.token_file = Path(token_file)
+        self._service = service                      # injectable for tests
+        self.folder_id: str | None = None
+        self._file_ids: dict[str, str] = {}
+
+    # ---- authentication -------------------------------------------------
+    def _authenticate(self):
+        from google.auth.exceptions import RefreshError
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+
+        creds = None
+        if self.token_file.exists():
+            creds = Credentials.from_authorized_user_file(str(self.token_file), SCOPES)
+        if creds and not creds.valid:
+            if creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except RefreshError:
+                    log.warning("Saved Google token is no longer valid; signing in again.")
+                    creds = None
+            else:
+                creds = None
+        if not creds:
+            if not self.credentials_file.exists():
+                raise StoreError(
+                    f"Google OAuth client file not found: {self.credentials_file}\n"
+                    "Create a Desktop-app OAuth client in Google Cloud Console, download it as "
+                    "credentials.json and place it in the project root (see BATCH_RUNBOOK.md).")
+            flow = InstalledAppFlow.from_client_secrets_file(str(self.credentials_file), SCOPES)
+            creds = flow.run_local_server(port=0)    # opens the browser once
+        self.token_file.write_text(creds.to_json(), encoding="utf-8")
+        try:
+            self.token_file.chmod(0o600)
+        except OSError:
+            pass
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    def _svc(self):
+        if self._service is None:
+            self._service = self._authenticate()
+        return self._service
+
+    # ---- low-level helpers ---------------------------------------------
+    def _list(self, q: str) -> list[dict]:
+        out: list[dict] = []
+        page_token = None
+        while True:
+            resp = self._svc().files().list(
+                q=q, spaces="drive", pageSize=100, pageToken=page_token,
+                fields="nextPageToken, files(id, name, modifiedTime)",
+            ).execute(num_retries=3)
+            out.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                return out
+
+    def _find_folder(self, name: str, parent_id: str) -> str | None:
+        """Case-insensitive folder lookup; if several match, use the most recently modified."""
+        q = f"'{parent_id}' in parents and mimeType='{FOLDER_MIME}' and trashed=false"
+        matches = [f for f in self._list(q) if f["name"].casefold() == name.casefold()]
+        if not matches:
+            return None
+        matches.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
+        if len(matches) > 1:
+            log.warning("Several folders named %r in the same place; using the most recently modified one.", name)
+        return matches[0]["id"]
+
+    def _create_folder(self, name: str, parent_id: str) -> str:
+        meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+        folder = self._svc().files().create(body=meta, fields="id").execute(num_retries=3)
+        log.info("Created Drive folder %r", name)
+        return folder["id"]
+
+    def _find_or_create(self, name: str, parent_id: str) -> str:
+        return self._find_folder(name, parent_id) or self._create_folder(name, parent_id)
+
+    def _find_file(self, name: str) -> str | None:
+        if name in self._file_ids:
+            return self._file_ids[name]
+        q = f"'{self.folder_id}' in parents and name='{name}' and trashed=false and mimeType!='{FOLDER_MIME}'"
+        matches = self._list(q)
+        if not matches:
+            return None
+        matches.sort(key=lambda f: f.get("modifiedTime", ""), reverse=True)
+        if len(matches) > 1:
+            log.warning("Several files named %r in the Drive folder; using the newest (nothing is deleted).", name)
+        self._file_ids[name] = matches[0]["id"]
+        return self._file_ids[name]
+
+    # ---- public interface ----------------------------------------------
+    def prepare(self) -> str:
+        """Find or create  <parent>/<output path...>  and return its Drive URL."""
+        folder = self._find_or_create(self.parent_name, "root")
+        for seg in self.segments:
+            folder = self._find_or_create(seg, folder)
+        self.folder_id = folder
+        return f"https://drive.google.com/drive/folders/{folder}"
+
+    def read(self, name: str) -> bytes | None:
+        if not self.folder_id:
+            raise StoreError("prepare() must be called first")
+        file_id = self._find_file(name)
+        if not file_id:
+            return None
+        return self._svc().files().get_media(fileId=file_id).execute(num_retries=3)
+
+    def write(self, name: str, data: bytes) -> None:
+        if not self.folder_id:
+            raise StoreError("prepare() must be called first")
+        mime = _MIME_BY_SUFFIX.get(Path(name).suffix, "application/octet-stream")
+        media = _media(data, mime)
+        file_id = self._find_file(name)
+        if file_id:
+            self._svc().files().update(fileId=file_id, media_body=media, fields="id").execute(num_retries=3)
+        else:
+            meta = {"name": name, "parents": [self.folder_id]}
+            created = self._svc().files().create(body=meta, media_body=media, fields="id").execute(num_retries=3)
+            self._file_ids[name] = created["id"]

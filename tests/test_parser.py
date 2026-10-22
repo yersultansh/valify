@@ -1,0 +1,227 @@
+"""Parser tests: run on saved HTML only, never touch the network."""
+from pathlib import Path
+
+import pytest
+
+from backend import config, parser, storage
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _fixture(name: str) -> str:
+    for base in (ROOT / "tests" / "fixtures", ROOT / "data" / "raw"):
+        p = base / name
+        if p.exists():
+            return p.read_text(encoding="utf-8")
+    pytest.skip(f"fixture {name} not found in tests/fixtures or data/raw")
+
+
+@pytest.fixture(scope="module")
+def cards():
+    return parser.parse_listing_cards(_fixture("listing.html"))
+
+
+@pytest.fixture(scope="module")
+def rows(cards):
+    return [parser.normalize_listing(c) for c in cards]
+
+
+def test_cards_parsed_with_unique_ids(cards):
+    ids = [c["listing_id"] for c in cards]
+    assert len(ids) >= 15 and len(ids) == len(set(ids))
+    assert all(c["url"].startswith("https://krisha.kz/a/show/") for c in cards)
+
+
+def test_new_builds_flagged(cards):
+    flagged = [c for c in cards if c["is_new_build"]]
+    assert flagged, "fixture is expected to contain new-build cards"
+    assert all(c["price_is_from"] or c["is_new_build"] for c in flagged)
+    assert any(not c["is_new_build"] for c in cards)
+
+
+def test_known_card_normalized(rows):
+    by_id = {r["listing_id"]: r for r in rows}
+    r = by_id["1011363915"]
+    assert r["price_kzt"] == 48_700_000
+    assert r["district"] == "Наурызбайский"
+    assert r["area_total"] == pytest.approx(67.2)
+    assert (r["floor"], r["floor_total"]) == (3, 10)
+    assert r["house_year"] == 2013
+    assert r["building_type"] == "монолит"
+    assert r["renovation"] == "хорошее"      # "не новый, но аккуратный ремонт"
+    assert r["rooms"] == 2
+
+
+def test_resale_rows_have_valid_values(rows):
+    for r in rows:
+        if r["is_new_build"]:
+            continue
+        assert r["price_kzt"] and r["price_kzt"] > 0
+        assert r["district"] in config.DISTRICTS
+        assert r["building_type"] in config.BUILDING_TYPES
+        assert r["renovation"] in config.RENOVATION_STATES
+        assert r["floor"] <= r["floor_total"]
+        assert 1950 <= r["house_year"] <= 2035
+        assert r["source"] == "krisha"
+
+
+def test_no_personal_data_in_output(rows, cards):
+    banned = {"phone", "phones", "owner", "ownername", "seller", "name"}
+    for r in rows:
+        assert not (banned & {k.lower() for k in r})
+    for c in cards:
+        assert not (banned & {k.lower() for k in c})
+
+
+def test_detail_page_parsing():
+    d = parser.parse_listing_detail(_fixture("detail.html"))
+    assert d["json_id"] == 696293781 and d["json_price"] == 35_000_000
+    assert d["building_raw"] == "монолитный" and d["year_raw"] == "2014"
+    assert d["floor_raw"] == "6 из 6" and d["renovation_raw"] == "свежий ремонт"
+    assert parser._district_from(d["district_raw"]) == "Наурызбайский"
+    assert not any("owner" in k.lower() or "phone" in k.lower() for k in d)
+
+
+def test_merge_detail_fills_gaps_only():
+    raw = {"listing_id": "1", "floor": None, "floor_total": None, "year_raw": "2000",
+           "building_raw": None, "renovation_raw": None, "area_text": "50", "subtitle": ""}
+    d = parser.parse_listing_detail(_fixture("detail.html"))
+    m = parser.merge_detail(raw, d)
+    assert (m["floor"], m["floor_total"]) == (6, 6)
+    assert m["year_raw"] == "2000"            # existing value is kept
+    assert m["building_raw"] == "монолитный"
+    assert parser.normalize_listing(m)["district"] == "Наурызбайский"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("свежий ремонт, потолки 3 м", "свежий ремонт"),
+    ("не новый, но аккуратный ремонт, санузел раздельный", "хорошее"),
+    ("требует ремонта", "требует ремонта"),
+    ("черновая отделка", "черновая отделка"),
+    ("что-то новое", "не указано"),
+    (None, "не указано"),
+])
+def test_renovation_mapping(text, expected):
+    assert parser._canon_renovation(text) == expected
+
+
+def test_building_mapping():
+    assert parser._canon_building("кирпичный") == "кирпич"
+    assert parser._canon_building("панельный") == "панель"
+    assert parser._canon_building("иной") == "иное"
+    assert parser._canon_building(None) is None
+
+
+def test_year_out_of_range_dropped():
+    r = parser.normalize_listing({"listing_id": "9", "price_text": "10 000 000 ₸", "year_raw": "1850"})
+    assert r["house_year"] is None
+
+
+def test_non_positive_price_rejected():
+    assert parser.normalize_listing({"listing_id": "9", "price_text": "0 ₸"})["price_kzt"] is None
+
+
+def test_robots_filter():
+    assert parser.is_allowed("https://krisha.kz/prodazha/kvartiry/almaty/?page=2")
+    assert parser.is_allowed("https://krisha.kz/a/show/123")
+    assert not parser.is_allowed("https://krisha.kz/a/show-map/123")
+    assert not parser.is_allowed("https://krisha.kz/prodazha/kvartiry/almaty/?das[raion]=1&raion=2")
+    assert not parser.is_allowed("https://krisha.kz/ajax/x")
+
+
+def test_captcha_detection_ignores_footer_notice():
+    html = _fixture("listing.html")
+    assert not parser.looks_like_captcha(html, "https://krisha.kz/prodazha/kvartiry/almaty/")
+    assert parser.looks_like_captcha("<html>x</html>", "https://krisha.kz/captcha?next=1")
+
+
+class _Resp:
+    def __init__(self, status, text="", url="https://krisha.kz/x"):
+        self.status_code, self.text, self.url, self.encoding = status, text, url, "utf-8"
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(self.status_code)
+
+
+@pytest.fixture
+def isolated(tmp_path, monkeypatch):
+    """Redirect the raw cache to tmp and remove delays."""
+    monkeypatch.setattr(config, "RAW_DIR", tmp_path)
+    monkeypatch.setattr(config, "MIN_DELAY", 0.0)
+    monkeypatch.setattr(config, "MAX_DELAY", 0.0)
+    monkeypatch.setattr(parser, "_last_request_ts", None)
+    monkeypatch.setattr(parser.time, "sleep", lambda s: None)
+    return tmp_path
+
+
+def test_collect_stops_on_403(isolated, monkeypatch):
+    calls = []
+
+    def fake_get(self, url, **kw):
+        calls.append(url)
+        return _Resp(403)
+
+    monkeypatch.setattr(parser.requests.Session, "get", fake_get)
+    stats = {}
+    rows = parser.collect(max_pages=3, max_listings=50, stats=stats)
+    assert rows == [] and stats["blocked"] is True
+    assert len(calls) == 1                      # no retries, no further pages
+
+
+def test_collect_skips_new_builds_and_uses_cache(isolated, monkeypatch):
+    html = _fixture("listing.html")
+    calls = []
+
+    def fake_get(self, url, **kw):
+        calls.append((url, kw["headers"].get("Referer")))
+        assert kw["timeout"] == config.REQUEST_TIMEOUT
+        assert kw["headers"]["Accept-Language"].startswith("ru-RU")
+        assert kw["headers"]["User-Agent"] in config.USER_AGENTS
+        return _Resp(200, html, url)
+
+    monkeypatch.setattr(parser.requests.Session, "get", fake_get)
+    stats = {}
+    rows = parser.collect(max_pages=2, max_listings=100, stats=stats)
+    assert stats["new_build_skipped"] >= 1 and not any(r["is_new_build"] for r in rows)
+    assert len({r["listing_id"] for r in rows}) == len(rows)       # de-duplicated across pages
+    assert len(calls) == 2 and calls[1][1] == config.SOURCE_URL    # Referer = previous page
+    n = len(calls)
+    parser.collect(max_pages=2, max_listings=100)                  # second run: all from cache
+    assert len(calls) == n
+
+
+def test_collect_respects_max_listings(isolated, monkeypatch):
+    html = _fixture("listing.html")
+    monkeypatch.setattr(parser.requests.Session, "get", lambda self, url, **kw: _Resp(200, html, url))
+    assert len(parser.collect(max_pages=3, max_listings=5)) == 5
+
+
+def test_storage_roundtrip_and_fallback_error(tmp_path, monkeypatch, rows):
+    path = storage.save_listings([r for r in rows if not r["is_new_build"]], tmp_path / "x.csv")
+    df = storage.read_listings(path)
+    assert list(df.columns) == storage.COLUMNS and len(df) > 0
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "c")
+    monkeypatch.setattr(storage, "PROCESSED_CSV", tmp_path / "c" / "d.csv")
+    monkeypatch.setattr(storage, "PROCESSED_META", tmp_path / "c" / "d.meta.json")
+    monkeypatch.setattr(config, "RAW_DIR", tmp_path / "empty_raw")
+    monkeypatch.setattr(config, "FALLBACK_CSV", tmp_path / "missing.csv")
+    with pytest.raises(FileNotFoundError):
+        storage.load_dataset(use_live=False)
+
+
+def test_load_dataset_uses_fallback_and_warns_on_synthetic(tmp_path, monkeypatch, rows):
+    fb = tmp_path / "fb.csv"
+    data = [dict(r, source="synthetic") for r in rows if not r["is_new_build"]]
+    storage.save_listings(data, fb)
+    df = storage.read_listings(fb)
+    df["source"] = "synthetic"
+    df.to_csv(fb, index=False, encoding="utf-8-sig")
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "c")        # never read the real data/cache (live store!)
+    monkeypatch.setattr(storage, "PROCESSED_CSV", tmp_path / "c" / "d.csv")
+    monkeypatch.setattr(storage, "PROCESSED_META", tmp_path / "c" / "d.meta.json")
+    monkeypatch.setattr(config, "RAW_DIR", tmp_path / "empty_raw")
+    monkeypatch.setattr(config, "FALLBACK_CSV", fb)
+    res = storage.load_dataset(use_live=False)
+    assert res.data_source == "offline_fallback" and res.rows == len(df)
+    assert any("демонстрационные" in w for w in res.warnings)

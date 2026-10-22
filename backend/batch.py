@@ -1,0 +1,369 @@
+"""Batch collector: one polite batch of krisha.kz listings per run, resumable.
+
+Each run:  pull state from storage (Google Drive or a local folder) -> walk the
+listing pages from the saved position -> skip every listing already in the
+tracker -> parse new ones into ``krisha_dataset.csv`` -> record each ID in
+``visited_urls.txt`` -> push everything back -> exit. Run it again whenever you
+like to fetch the next batch. 100 % real data: nothing synthetic is ever made.
+
+    python -m backend.batch --status      # no krisha.kz requests
+    python -m backend.batch               # one batch (BATCH_SIZE, BATCH_MAX_PAGES)
+
+Exit codes: 0 ok | 1 error | 2 blocked (403/429/captcha) | 3 storage sync failed | 130 Ctrl+C
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import logging
+import os
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+from backend import config, parser, storage
+from backend.drive_store import DriveStore, LocalStore, StoreError
+
+log = logging.getLogger("batch")
+
+DATASET_NAME = "krisha_dataset.csv"
+VISITED_NAME = "visited_urls.txt"
+STATE_NAME = "batch_state.json"
+WORK_DIR = config.CACHE_DIR / "batch"          # local working copy (crash-safe appends)
+COLUMNS = storage.COLUMNS
+
+
+# --------------------------------------------------------------------------
+# Settings (.env)
+# --------------------------------------------------------------------------
+@dataclass
+class Settings:
+    backend: str = "local"                      # drive | local
+    batch_size: int = 80
+    max_pages: int = 5
+    min_delay: float = 8.0
+    max_delay: float = 12.0
+    target_total: int = 500
+    overlap: int = 1
+    include_new_builds: bool = False
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        g = os.getenv
+        s = cls(
+            backend=g("STORE_BACKEND", "local").lower(),
+            batch_size=int(g("BATCH_SIZE", "80")),
+            max_pages=int(g("BATCH_MAX_PAGES", "5")),
+            min_delay=float(g("BATCH_MIN_DELAY", "8.0")),
+            max_delay=float(g("BATCH_MAX_DELAY", "12.0")),
+            target_total=int(g("TARGET_TOTAL", "500")),
+            overlap=int(g("RESUME_OVERLAP_PAGES", "1")),
+            include_new_builds=g("INCLUDE_NEW_BUILDS", "false").lower() == "true",
+        )
+        return s.clamped()
+
+    def clamped(self) -> "Settings":
+        """Respect the hard per-run limits from .env (MAX_PAGES, MAX_LISTINGS)."""
+        if self.batch_size > config.MAX_LISTINGS:
+            log.warning("BATCH_SIZE %d > MAX_LISTINGS %d; using %d (raise MAX_LISTINGS in .env to change).",
+                        self.batch_size, config.MAX_LISTINGS, config.MAX_LISTINGS)
+            self.batch_size = config.MAX_LISTINGS
+        if self.max_pages > config.MAX_PAGES:
+            log.warning("BATCH_MAX_PAGES %d > MAX_PAGES %d; using %d (raise MAX_PAGES in .env to change).",
+                        self.max_pages, config.MAX_PAGES, config.MAX_PAGES)
+            self.max_pages = config.MAX_PAGES
+        self.min_delay, self.max_delay = sorted((self.min_delay, self.max_delay))
+        return self
+
+
+def make_store(s: Settings):
+    if s.backend == "local":
+        folder = os.getenv("LOCAL_STORE_DIR", "data/collected").strip()
+        if not folder:
+            raise StoreError("STORE_BACKEND=local needs LOCAL_STORE_DIR in .env "
+                             "(e.g. your 'Google Drive for desktop' folder).")
+        path = Path(folder).expanduser()
+        return LocalStore(path if path.is_absolute() else config.BASE_DIR / path)
+    if s.backend != "drive":
+        raise StoreError(f"Unknown STORE_BACKEND={s.backend!r} (use 'drive' or 'local').")
+    return DriveStore(
+        parent_name=config.GOOGLE_DRIVE_OUTPUT_FOLDER,
+        output_path=os.getenv("DRIVE_OUTPUT_PATH", "almaty-flat-calculator/data/collected"),
+        credentials_file=config.BASE_DIR / os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json"),
+        token_file=config.BASE_DIR / os.getenv("GOOGLE_TOKEN_FILE", "token.json"),
+    )
+
+
+# --------------------------------------------------------------------------
+# CSV helpers (plain csv module: values stay exactly as written)
+# --------------------------------------------------------------------------
+def _parse_csv(data: bytes | None) -> list[dict]:
+    if not data:
+        return []
+    return list(csv.DictReader(io.StringIO(data.decode("utf-8-sig"))))
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:      # BOM: Excel shows Cyrillic
+        w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _id_from_line(line: str) -> str | None:
+    m = re.search(r"(\d{5,})\s*$", line.strip())
+    return m.group(1) if m else None
+
+
+def page_url(page: int) -> str:
+    return config.SOURCE_URL if page <= 1 else f"{config.SOURCE_URL}?page={page}"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------
+# Tracker: local working copy + sync with the store
+# --------------------------------------------------------------------------
+class Tracker:
+    def __init__(self, work_dir: Path = WORK_DIR):
+        self.work = work_dir
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.csv_path = work_dir / DATASET_NAME
+        self.visited_path = work_dir / VISITED_NAME
+        self.state_path = work_dir / STATE_NAME
+        self.ids: set[str] = set()          # listing IDs stored in the CSV
+        self.visited: set[str] = set()      # IDs in the tracker (superset of ids)
+        self.state: dict = {}
+
+    def pull(self, store) -> None:
+        """Merge store + local working copy (union by ID); the store is the source of truth,
+        the local copy only adds rows a previous failed upload left behind."""
+        local_csv = self.csv_path.read_bytes() if self.csv_path.exists() else None
+        rows, index = [], {}
+        for r in _parse_csv(store.read(DATASET_NAME)) + _parse_csv(local_csv):
+            lid = (r.get("listing_id") or "").strip()
+            if not lid:
+                continue
+            if lid not in index:
+                index[lid] = len(rows)
+                rows.append(r)
+            else:                                           # same listing in both copies: keep the more complete data
+                kept = rows[index[lid]]
+                for key, value in r.items():
+                    if value not in (None, "") and kept.get(key) in (None, ""):
+                        kept[key] = value
+        seen = set(index)
+        _write_csv(self.csv_path, rows)
+        self.ids = set(seen)
+
+        lines: list[str] = []
+        for blob in (store.read(VISITED_NAME),
+                     self.visited_path.read_bytes() if self.visited_path.exists() else None):
+            if blob:
+                lines += blob.decode("utf-8").splitlines()
+        ordered = [i for i in (_id_from_line(l) for l in lines) if i]
+        ordered += [r["listing_id"].strip() for r in rows]          # dataset IDs count as visited
+        self.visited = set(ordered)
+        unique = list(dict.fromkeys(ordered))
+        self.visited_path.write_text("".join(f"{parser.BASE_URL}/a/show/{i}\n" for i in unique), encoding="utf-8")
+
+        candidates = []
+        for blob in (store.read(STATE_NAME),
+                     self.state_path.read_bytes() if self.state_path.exists() else None):
+            try:
+                candidates.append(json.loads(blob.decode("utf-8")) if blob else {})
+            except ValueError:
+                candidates.append({})
+        self.state = max(candidates, key=lambda d: d.get("updated_at", ""), default={})
+        self.save_state()
+
+    def add_row(self, row: dict) -> None:
+        """Append to the CSV first, then to the tracker, so a crash never loses a parsed row."""
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore").writerow(row)
+            f.flush()
+        with open(self.visited_path, "a", encoding="utf-8") as f:
+            f.write(f"{row['url']}\n")
+            f.flush()
+        self.ids.add(row["listing_id"])
+        self.visited.add(row["listing_id"])
+
+    def save_state(self) -> None:
+        self.state["updated_at"] = _now()
+        self.state_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def push(self, store) -> bool:
+        self.save_state()
+        try:
+            for name, path in ((DATASET_NAME, self.csv_path), (VISITED_NAME, self.visited_path),
+                               (STATE_NAME, self.state_path)):
+                store.write(name, path.read_bytes())
+            return True
+        except Exception as exc:
+            log.error("Could not upload progress to storage: %s", exc)
+            log.error("Progress is safe in %s and will be merged on the next run.", self.work)
+            return False
+
+
+# --------------------------------------------------------------------------
+# One batch
+# --------------------------------------------------------------------------
+def run_batch(store, s: Settings, start_page: int | None = None, details: int = 0) -> int:
+    config.MIN_DELAY, config.MAX_DELAY = s.min_delay, s.max_delay    # parser.fetch reads these per request
+    location = store.prepare()
+    t = Tracker()
+    t.pull(store)
+    total_before = len(t.ids)
+    print(f"Storage: {location}")
+    print(f"Dataset: {total_before} rows | tracker: {len(t.visited)} IDs | target: {s.target_total}")
+    if total_before >= s.target_total:
+        print(f"TARGET REACHED ({total_before} >= {s.target_total}). Raise TARGET_TOTAL to collect more.")
+        t.push(store)
+        return 0
+
+    page = start_page or max(1, int(t.state.get("next_page", 1)) - s.overlap)
+    first_page = page
+    stats: dict = {}
+    added = pages = stall = skipped_visited = new_builds = 0
+    details_left = details
+    referer: str | None = None
+    reason, code = "max_pages_reached", 0
+    print(f"Starting at page {page}: up to {s.batch_size} new listings / {s.max_pages} pages, "
+          f"delay {s.min_delay:g}-{s.max_delay:g} s between requests.")
+
+    try:
+        while pages < s.max_pages:
+            url = page_url(page)
+            html = parser.fetch(url, referer=referer, stats=stats)
+            pages += 1
+            referer = url
+            cards = parser.parse_listing_cards(html)
+            if not cards:
+                reason = "no_more_pages"
+                t.state["next_page"] = 1
+                break
+            new_on_page, limit_hit = 0, False
+            page_done = True
+            for idx, raw in enumerate(cards):
+                if raw["listing_id"] in t.visited:                      # tracker check first
+                    skipped_visited += 1
+                    continue
+                if raw["is_new_build"] and not s.include_new_builds:
+                    new_builds += 1
+                    continue
+                needs_detail = raw["floor"] is None or not raw["year_raw"] or not parser._district_from(raw["subtitle"])
+                if needs_detail and details_left > 0 and not raw["is_new_build"]:
+                    detail = parser.parse_listing_detail(parser.fetch(raw["url"], referer=url, stats=stats))
+                    raw = parser.merge_detail(raw, detail)
+                    details_left -= 1
+                t.add_row(parser.normalize_listing(raw))
+                added += 1
+                new_on_page += 1
+                if added >= s.batch_size or len(t.ids) >= s.target_total:
+                    limit_hit = True
+                    page_done = idx == len(cards) - 1
+                    break
+            t.state["next_page"] = page + 1 if page_done else page
+            t.push(store)                                               # sync after every page
+            stall = 0 if new_on_page else stall + 1
+            if limit_hit:
+                reason = "target_reached" if len(t.ids) >= s.target_total else "batch_size_reached"
+                break
+            if stall >= s.overlap + 2:
+                reason = "no_new_listings"
+                break
+            page += 1
+    except parser.BlockedError as exc:
+        reason, code = "blocked", 2
+        print("\n" + "=" * 70)
+        print(f"STOPPED: krisha.kz blocked the request ({exc}).")
+        print("Progress is saved. Do NOT retry right away: wait several hours (or a day),")
+        print("and consider a longer delay or a smaller BATCH_SIZE. No bypass is attempted.")
+        print("=" * 70)
+    except KeyboardInterrupt:
+        reason, code = "interrupted", 130
+        print("\nInterrupted by user. Saving progress ...")
+    except Exception as exc:
+        reason, code = "error", 1
+        log.exception("Batch failed: %s", exc)
+    finally:
+        runs = t.state.setdefault("runs", [])
+        runs.append({"at": _now(), "start_page": first_page, "pages": pages, "added": added, "reason": reason})
+        t.state["runs"] = runs[-30:]
+        if not t.push(store) and code == 0:
+            code = 3
+
+    total = len(t.ids)
+    print("\n--- Batch summary ---")
+    print(f"Added: {added} new listings | total in dataset: {total}/{s.target_total}")
+    print(f"Pages: {pages} (network: {stats.get('pages_fetched', 0)}, cache: {stats.get('cache_hits', 0)}) | "
+          f"skipped already-visited: {skipped_visited} | new builds skipped: {new_builds}")
+    print(f"Stop reason: {reason} | next start page: {t.state.get('next_page', 1)}")
+    if reason == "no_new_listings":
+        print("Hint: the pages are already collected. Try  --start-page N  with a larger N.")
+    if reason == "no_more_pages":
+        print("Reached the end of the listing pages; next run restarts from page 1.")
+    if total >= s.target_total:
+        print("TARGET REACHED. Next: download krisha_dataset.csv and say 'clean and build the model'.")
+    elif code == 0:
+        print("Run the same command again later (30 min, 2 h or tomorrow) for the next batch.")
+    return code
+
+
+
+
+
+
+def show_status(store, s: Settings) -> int:
+    location = store.prepare()
+    t = Tracker()
+    t.pull(store)
+    print(f"Storage: {location}")
+    print(f"Dataset rows: {len(t.ids)} / target {s.target_total} | tracker IDs: {len(t.visited)}")
+    print(f"Next start page: {t.state.get('next_page', 1)}")
+    for r in t.state.get("runs", [])[-5:]:
+        if r.get("kind") == "enrich":
+            continue  # Historical state is retained, but this retired mode is not offered.
+        print(f"  run {r['at']}: pages {r['start_page']}+{r['pages']}, added {r['added']}, {r['reason']}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Collect ONE batch of Almaty flat listings (resumable).")
+    ap.add_argument("--status", action="store_true", help="show progress; makes no krisha.kz requests")
+    ap.add_argument("--batch-size", type=int)
+    ap.add_argument("--max-pages", type=int)
+    ap.add_argument("--start-page", type=int, help="override the saved resume position")
+    ap.add_argument("--details", type=int, default=0, help="max detail-page requests this run (default 0)")
+    ap.add_argument("--include-new-builds", action="store_true")
+    ap.add_argument("--backend", choices=["drive", "local"])
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+
+    s = Settings.from_env()
+    if args.batch_size:
+        s.batch_size = args.batch_size
+    if args.max_pages:
+        s.max_pages = args.max_pages
+    if args.backend:
+        s.backend = args.backend
+    s.include_new_builds = s.include_new_builds or args.include_new_builds
+    s.clamped()
+    try:
+        store = make_store(s)
+        if args.status:
+            return show_status(store, s)
+        return run_batch(store, s, args.start_page, args.details)
+    except StoreError as exc:
+        print(f"Setup problem: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

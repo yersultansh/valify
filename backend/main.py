@@ -1,0 +1,338 @@
+"""FastAPI application: routes, request validation (Pydantic, Russian messages), static files.
+
+Run:  uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+
+No parsing or ML logic lives here; everything goes through ``backend.service``.
+The model trains in a background thread at startup, so the server answers
+immediately: ``/api/health`` reports ``training`` and ``/api/predict`` answers
+503 with ``Retry-After`` until the model is ready.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from backend import config
+from backend import service as service_mod
+
+log = logging.getLogger(__name__)
+
+FIELD_LABELS = {
+    "district": "Район", "area_total": "Общая площадь", "floor": "Этаж",
+    "floor_total": "Этажей в доме", "house_year": "Год постройки", "building_type": "Тип дома",
+    "renovation": "Состояние отделки",
+}
+PLACEHOLDER_HTML = (
+    "<!doctype html><html lang='ru'><meta charset='utf-8'><title>Калькулятор квартир Алматы</title>"
+    "<body style='font-family:sans-serif;max-width:40rem;margin:3rem auto'>"
+    "<h1>Калькулятор стоимости квартир, Алматы</h1>"
+    "<p>Веб-интерфейс ещё не установлен (этап 6). API работает: "
+    "<a href='/docs'>документация /docs</a>, <a href='/api/health'>/api/health</a>.</p></body></html>"
+)
+
+
+# --------------------------------------------------------------------------
+# Request / response models
+# --------------------------------------------------------------------------
+class PredictRequest(BaseModel):
+    """Flat parameters. Renovation is preserved; unknown legacy fields are ignored."""
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    district: str = Field(description="Район", json_schema_extra={"enum": config.DISTRICTS},
+                          examples=["Бостандыкский"])
+    area_total: float = Field(ge=10, le=400, allow_inf_nan=False, description="Общая площадь, м²", examples=[54.0])
+    floor: int = Field(ge=1, le=200, description="Этаж", examples=[5])
+    floor_total: int = Field(ge=1, le=200, description="Этажей в доме", examples=[9])
+    house_year: int = Field(description="Год постройки (1950 .. текущий год + 5)", examples=[2012])
+    building_type: str = Field(description="Тип дома", json_schema_extra={"enum": config.BUILDING_TYPES},
+                               examples=["монолит"])
+    renovation: int | None = Field(default=None, description="Отделка: 0 = «Черновая отделка», 1 = «Другое»",
+                                   examples=[1])
+    @field_validator("renovation", mode="before")
+    @classmethod
+    def _renovation(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            t = v.strip().lower()
+            v = int(t) if t in ("0", "1") else (0 if "черновая" in t else 1)
+        if isinstance(v, bool):
+            v = int(v)
+        if v in (0, 1):
+            return int(v)
+        raise ValueError("Состояние отделки: 0 — «Черновая отделка», 1 — «Другое».")
+
+    @field_validator("district")
+    @classmethod
+    def _district(cls, v: str) -> str:
+        if v not in config.DISTRICTS:
+            raise ValueError("Выберите район из списка: " + ", ".join(config.DISTRICTS) + ".")
+        return v
+
+    @field_validator("building_type")
+    @classmethod
+    def _building_type(cls, v: str) -> str:
+        if v not in config.BUILDING_TYPES:
+            raise ValueError("Выберите тип дома из списка: " + ", ".join(config.BUILDING_TYPES) + ".")
+        return v
+
+    @field_validator("house_year")
+    @classmethod
+    def _year(cls, v: int) -> int:
+        top = datetime.now().year + 5
+        if not 1950 <= v <= top:
+            raise ValueError(f"Год постройки должен быть от 1950 до {top}.")
+        return v
+
+    @field_validator("floor_total")
+    @classmethod
+    def _floor_vs_total(cls, v: int, info: ValidationInfo) -> int:
+        floor = info.data.get("floor")
+        if floor is not None and floor > v:
+            raise ValueError(f"Этаж ({floor}) не может быть больше этажности дома ({v}).")
+        return v
+
+
+class Comparable(BaseModel):
+    url: str | None = None
+    price_kzt: int
+    area_total: float
+    floor: int | None = None
+    floor_total: int | None = None
+    house_year: int | None = None
+    district: str | None = None
+    building_type: str | None = None
+
+
+class ModelMetrics(BaseModel):
+    mae: float | None = None
+    rmse: float | None = None
+    mape: float | None = None
+    r2: float | None = None
+    evaluation: str
+    model: str
+    naive_mape: float | None = None
+    beats_baseline: bool = False
+
+
+class PredictResponse(BaseModel):
+    price_estimate_kzt: int
+    price_low_kzt: int
+    price_high_kzt: int
+    price_per_m2_kzt: int
+    district_median_price_per_m2_kzt: int | None = None
+    vs_district_median_pct: float | None = None
+    comparables: list[Comparable]
+    model_metrics: ModelMetrics
+    data_source: str
+    data_collected_from: str | None = None
+    data_collected_to: str | None = None
+    rows_used: int
+    warnings: list[str]
+
+
+# --------------------------------------------------------------------------
+# Russian error messages
+# --------------------------------------------------------------------------
+def russian_error(err: dict) -> dict:
+    """Turn one Pydantic error into {'field', 'message'} in Russian."""
+    t, ctx = err.get("type", ""), err.get("ctx") or {}
+    loc = [p for p in err.get("loc", ()) if p != "body"]
+    field = str(loc[-1]) if loc and isinstance(loc[-1], str) else "body"
+    label = FIELD_LABELS.get(field, field)
+    if t == "json_invalid":
+        field, msg = "body", "Некорректный JSON в теле запроса."
+    elif t in ("model_attributes_type", "dict_type", "model_type"):
+        field, msg = "body", "Тело запроса должно быть JSON-объектом."
+    elif t == "missing":
+        msg = "Тело запроса отсутствует." if field == "body" else f"Поле «{label}» обязательно для заполнения."
+    elif t in ("int_parsing", "int_type", "int_from_float"):
+        msg = f"Поле «{label}» должно быть целым числом."
+    elif t in ("float_parsing", "float_type", "finite_number"):
+        msg = f"Поле «{label}» должно быть числом."
+    elif t == "greater_than_equal":
+        msg = f"Поле «{label}» должно быть не меньше {_num(ctx.get('ge'))}."
+    elif t == "less_than_equal":
+        msg = f"Поле «{label}» должно быть не больше {_num(ctx.get('le'))}."
+    elif t == "greater_than":
+        msg = f"Поле «{label}» должно быть больше {_num(ctx.get('gt'))}."
+    elif t == "less_than":
+        msg = f"Поле «{label}» должно быть меньше {_num(ctx.get('lt'))}."
+    elif t == "string_type":
+        msg = f"Поле «{label}» должно быть текстом."
+    elif t == "value_error":
+        msg = str(err.get("msg", "")).removeprefix("Value error, ")
+    else:
+        msg = f"Некорректное значение поля «{label}»."
+    return {"field": field, "message": msg}
+
+
+def _num(x) -> str:
+    """10.0 -> '10', 2.5 -> '2.5' (for readable limits in messages)."""
+    return f"{x:g}" if isinstance(x, (int, float)) else str(x)
+
+
+HTTP_MESSAGES = {404: "Страница не найдена.", 405: "Метод не поддерживается.", 422: "Некорректный запрос."}
+
+
+# --------------------------------------------------------------------------
+# App factory
+# --------------------------------------------------------------------------
+def create_app(svc: service_mod.PriceService | None = None, warmup: bool = True) -> FastAPI:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    def _warm(app: FastAPI) -> None:
+        try:
+            app.state.service.warmup()
+        except Exception:                             # already logged by the service; health reports it
+            log.warning("Model warm-up failed; /api/health shows the error.")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if warmup:
+            thread = threading.Thread(target=_warm, args=(app,), name="model-warmup", daemon=True)
+            app.state.warmup_thread = thread
+            thread.start()
+        yield
+
+    app = FastAPI(
+        title="Almaty Flat Price Calculator",
+        version="0.9.0",
+        description="Оценка стоимости квартиры в Алматы по реальным объявлениям krisha.kz. "
+                    "Оценка ориентировочная и не является официальной оценкой стоимости недвижимости.",
+        lifespan=lifespan,
+    )
+    app.state.service = svc or service_mod.get_service()
+    app.state.warmup_thread = None
+
+    origins = [f"http://127.0.0.1:{config.PORT}", f"http://localhost:{config.PORT}"]
+    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"],
+                       allow_headers=["Content-Type"])
+
+    # ---- error handlers (all bodies carry a Russian 'message') ----------
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError):
+        items = [russian_error(e) for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"message": " ".join(i["message"] for i in items),
+                                                      "detail": items})
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        detail = exc.detail if isinstance(exc.detail, str) else HTTP_MESSAGES.get(exc.status_code, "Ошибка запроса.")
+        if detail in ("Not Found", "Method Not Allowed"):
+            detail = HTTP_MESSAGES.get(exc.status_code, detail)
+        return JSONResponse(status_code=exc.status_code, content={"message": detail, "detail": detail},
+                            headers=getattr(exc, "headers", None))
+
+    @app.exception_handler(Exception)
+    async def _unexpected(request: Request, exc: Exception):
+        log.exception("Unhandled error on %s %s", request.method, request.url.path)
+        msg = "Внутренняя ошибка сервера. Попробуйте позже."
+        return JSONResponse(status_code=500, content={"message": msg, "detail": msg})
+
+    # ---- helpers -------------------------------------------------------
+    def _status(request: Request) -> str:
+        h = request.app.state.service.health()["status"]
+        t = request.app.state.warmup_thread
+        return "training" if h != "ok" and t is not None and t.is_alive() else h
+
+    def _require_ready(request: Request) -> service_mod.PriceService:
+        s = request.app.state.service
+        if _status(request) == "training":
+            raise HTTPException(503, "Модель обучается, повторите запрос через несколько секунд.",
+                                headers={"Retry-After": "5"})
+        try:
+            s.ensure_ready()                          # no-op when ready; lazy start / retry after an error
+        except service_mod.ServiceError:
+            raise HTTPException(503, "Данные или модель сейчас недоступны. Подробности: /api/health.")
+        return s
+
+    # ---- routes --------------------------------------------------------
+    @app.get("/", include_in_schema=False)
+    def index():
+        page = config.FRONTEND_DIR / "index.html"
+        if page.exists():
+            return FileResponse(page, headers={"Cache-Control": "no-cache"})
+        return HTMLResponse(PLACEHOLDER_HTML)
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon():
+        return Response(status_code=204)
+
+    @app.get("/api/health", tags=["api"])
+    def health(request: Request):
+        h = request.app.state.service.health()
+        return {"status": _status(request), "data_source": h["data_source"], "rows": h["rows"],
+                "model_trained_at": h["model_trained_at"], "error": h["error"]}
+
+    @app.get("/api/options", tags=["api"])
+    def options(request: Request):
+        return request.app.state.service.options()
+
+    @app.post("/api/predict", response_model=PredictResponse, tags=["api"])
+    def predict(body: PredictRequest, request: Request):
+        s = _require_ready(request)
+        return s.predict(body.model_dump())
+
+    @app.get("/api/stats", tags=["api"])
+    def stats(request: Request, district: str | None = None):
+        district = district or None
+        if district is not None and district not in config.DISTRICTS:
+            raise HTTPException(422, "Район должен быть одним из: " + ", ".join(config.DISTRICTS) + ".")
+        s = _require_ready(request)
+        try:
+            return s.stats(district)
+        except KeyError:
+            raise HTTPException(404, f"Нет данных по району «{district}».")
+
+    @app.post("/api/refresh", status_code=202, tags=["api"])
+    def refresh(request: Request):
+        """Collect fresh listings from krisha.kz in the background and retrain (max once per 10 minutes)."""
+        s = request.app.state.service
+        if _status(request) == "training":
+            raise HTTPException(503, "Модель обучается, повторите запрос через несколько секунд.",
+                                headers={"Retry-After": "5"})
+        r = s.start_refresh()
+        if r["outcome"] == "started":
+            return {"status": "started", "message": "Обновление данных запущено. Состояние: GET /api/refresh/status.",
+                    "min_interval_seconds": service_mod.REFRESH_MIN_INTERVAL_S}
+        if r["outcome"] == "running":
+            raise HTTPException(409, "Обновление уже выполняется. Состояние: GET /api/refresh/status.")
+        if r["outcome"] == "rate_limited":
+            wait = r["retry_after"]
+            raise HTTPException(429, f"Обновление можно запускать не чаще одного раза в 10 минут. "
+                                     f"Повторите через {wait // 60} мин {wait % 60} с.",
+                                headers={"Retry-After": str(wait)})
+        raise HTTPException(403, "Живой парсинг отключён. Чтобы разрешить обновление, установите "
+                                 "USE_LIVE_PARSER=true в .env и перезапустите сервер.")
+
+    @app.get("/api/refresh/status", tags=["api"])
+    def refresh_status(request: Request):
+        return request.app.state.service.refresh_status()
+
+    app.mount("/static", StaticFiles(directory=str(config.FRONTEND_DIR), check_dir=False), name="static")
+    return app
+
+
+app = create_app()
+
+
+def main() -> None:
+    """Start the server with the HOST / PORT from .env."""
+    import uvicorn
+    uvicorn.run("backend.main:app", host=config.HOST, port=config.PORT)
+
+
+if __name__ == "__main__":
+    main()

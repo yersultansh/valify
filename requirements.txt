@@ -1,0 +1,21 @@
+# Pinned to the versions the full test suite (128 tests) was run against. Python 3.11+ required
+# (pandas 3, NumPy 2.4 and scikit-learn 1.8 do not support 3.10).
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+requests==2.33.1
+beautifulsoup4==4.14.3
+lxml==6.0.2
+pandas==3.0.2
+numpy==2.4.4
+scikit-learn==1.8.0
+joblib==1.5.3
+python-dotenv==1.2.2
+pydantic==2.13.5
+pytest==9.1.1
+httpx==0.28.1
+
+# Optional: only for STORE_BACKEND=drive in the batch collector (Google Drive API).
+# Not needed with STORE_BACKEND=local (Google Drive for desktop). Uncomment to install:
+# google-api-python-client==2.201.0
+# google-auth-httplib2==0.4.4
+# google-auth-oauthlib==1.5.0

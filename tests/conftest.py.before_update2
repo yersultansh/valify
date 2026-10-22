@@ -1,0 +1,18 @@
+"""Shared pytest configuration."""
+import importlib.util
+
+import pytest
+
+# Tests that exercise the real Google upload helper. They are only relevant for
+# STORE_BACKEND=drive, which needs google-api-python-client; with the local
+# (Google Drive for desktop) backend that package is not required.
+_NEEDS_GOOGLE_CLIENT = {"test_drive_write_updates_in_place_without_duplicates"}
+
+
+def pytest_collection_modifyitems(config, items):
+    if importlib.util.find_spec("googleapiclient") is not None:
+        return
+    skip = pytest.mark.skip(reason="google-api-python-client not installed (only needed for STORE_BACKEND=drive)")
+    for item in items:
+        if item.name in _NEEDS_GOOGLE_CLIENT:
+            item.add_marker(skip)

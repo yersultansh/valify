@@ -1,0 +1,238 @@
+"""Spatial features for listings: nearby schools, hospitals, kindergartens and distance to the metro.
+
+* Points of interest (POI) come from OpenStreetMap through the Overpass API. They are downloaded once with
+  ``python -m backend.geo --fetch`` and cached in data/cache/poi.json. Data (c) OpenStreetMap contributors (ODbL).
+* All distances are straight-line (haversine) kilometres, not walking distances.
+* This module makes exactly one kind of HTTP request (the Overpass query); everything else is pure maths.
+
+CLI:  python -m backend.geo --fetch      download POI around the listings (needs coordinates in the dataset)
+      python -m backend.geo --check      coverage and statistics of the computed features
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import requests
+
+from backend import config, storage
+
+log = logging.getLogger(__name__)
+
+EARTH_RADIUS_KM = 6371.0088
+RADIUS_KM = 2.0
+GEO_FEATURES = ["schools_within_2km", "hospitals_within_2km", "kindergartens_within_2km", "dist_to_metro"]
+OVERPASS_URLS = ("https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter")
+USER_AGENT = "almaty-flat-calculator/1.0 (personal, non-commercial research)"
+ALMATY_BBOX = (43.0, 76.5, 43.6, 77.4)          # south, west, north, east; the metro is searched city-wide
+DEFAULT_LISTING_BBOX = (43.10, 76.70, 43.45, 77.15)
+# duplicate removal: same name closer than SAME_NAME_KM, or any two objects closer than ANY_KM
+DEDUP = {"schools": (0.15, 0.02), "kindergartens": (0.15, 0.02), "hospitals": (0.25, 0.03), "metro": (0.5, 0.25)}
+CATEGORIES = ("schools", "hospitals", "kindergartens", "metro")
+
+
+class GeoError(RuntimeError):
+    """POI download or processing failed."""
+
+
+# --------------------------------------------------------------------------
+# Distances
+# --------------------------------------------------------------------------
+def _hav(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+def haversine_matrix(lat: np.ndarray, lon: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Distances in km between n listings and m points -> array (n, m)."""
+    la1, lo1 = np.radians(lat)[:, None], np.radians(lon)[:, None]
+    la2, lo2 = np.radians(points[:, 0])[None, :], np.radians(points[:, 1])[None, :]
+    a = np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
+
+
+def _as_points(raw) -> np.ndarray:
+    arr = np.asarray(raw if raw is not None else [], dtype=float).reshape(-1, 2) if len(raw or []) else np.empty((0, 2))
+    return arr[:, :2]
+
+
+def count_within(lat, lon, points, radius_km: float = RADIUS_KM) -> np.ndarray:
+    """Number of points within ``radius_km`` of each listing."""
+    lat, lon, pts = np.asarray(lat, float), np.asarray(lon, float), _as_points(points)
+    if len(pts) == 0:
+        return np.zeros(len(lat), dtype=int)
+    out = np.empty(len(lat), dtype=int)
+    for i in range(0, len(lat), 500):                       # chunks keep the (n x m) matrix small
+        out[i:i + 500] = (haversine_matrix(lat[i:i + 500], lon[i:i + 500], pts) <= radius_km).sum(axis=1)
+    return out
+
+
+def nearest_km(lat, lon, points) -> np.ndarray:
+    """Distance in km from each listing to the nearest point (NaN if there are no points)."""
+    lat, lon, pts = np.asarray(lat, float), np.asarray(lon, float), _as_points(points)
+    if len(pts) == 0:
+        return np.full(len(lat), np.nan)
+    return np.concatenate([haversine_matrix(lat[i:i + 500], lon[i:i + 500], pts).min(axis=1)
+                           for i in range(0, len(lat), 500)])
+
+
+def add_geo_features(df: pd.DataFrame, poi: dict) -> pd.DataFrame:
+    """Add the four spatial features; rows without valid coordinates get NaN."""
+    d = df.copy()
+    for col in GEO_FEATURES:
+        d[col] = np.nan
+    if "latitude" not in d.columns or "longitude" not in d.columns:
+        return d
+    lat = pd.to_numeric(d["latitude"], errors="coerce")
+    lon = pd.to_numeric(d["longitude"], errors="coerce")
+    ok = (lat.notna() & lon.notna()).to_numpy()
+    if not ok.any():
+        return d
+    la, lo = lat.to_numpy()[ok], lon.to_numpy()[ok]
+    d.loc[ok, "schools_within_2km"] = count_within(la, lo, poi.get("schools"))
+    d.loc[ok, "hospitals_within_2km"] = count_within(la, lo, poi.get("hospitals"))
+    d.loc[ok, "kindergartens_within_2km"] = count_within(la, lo, poi.get("kindergartens"))
+    d.loc[ok, "dist_to_metro"] = nearest_km(la, lo, poi.get("metro"))
+    return d
+
+
+# --------------------------------------------------------------------------
+# POI download (OpenStreetMap / Overpass)
+# --------------------------------------------------------------------------
+def bbox_for(df: pd.DataFrame, margin_deg: float = 0.04) -> tuple[float, float, float, float]:
+    """Bounding box of the listings plus a margin (about 3-4 km), as (south, west, north, east)."""
+    lat = pd.to_numeric(df.get("latitude"), errors="coerce").dropna() if "latitude" in df else pd.Series(dtype=float)
+    lon = pd.to_numeric(df.get("longitude"), errors="coerce").dropna() if "longitude" in df else pd.Series(dtype=float)
+    if lat.empty or lon.empty:
+        s, w, n, e = DEFAULT_LISTING_BBOX
+    else:
+        s, w, n, e = float(lat.min()), float(lon.min()), float(lat.max()), float(lon.max())
+    return (round(s - margin_deg, 4), round(w - margin_deg, 4), round(n + margin_deg, 4), round(e + margin_deg, 4))
+
+
+def overpass_query(bbox: tuple, metro_bbox: tuple = ALMATY_BBOX) -> str:
+    b = ",".join(str(v) for v in bbox)
+    m = ",".join(str(v) for v in metro_bbox)
+    return (
+        "[out:json][timeout:120];(\n"
+        f'  nwr["amenity"="school"]({b});\n'
+        f'  nwr["amenity"="kindergarten"]({b});\n'
+        f'  nwr["amenity"="hospital"]({b});\n'
+        f'  nwr["healthcare"="hospital"]({b});\n'
+        f'  nwr["railway"="station"]["station"="subway"]({m});\n'
+        f'  nwr["public_transport"="station"]["subway"="yes"]({m});\n'
+        ");\nout center tags;"
+    )
+
+
+def _category(tags: dict) -> str | None:
+    if tags.get("railway") == "station" and tags.get("station") == "subway":
+        return "metro"
+    if tags.get("public_transport") == "station" and tags.get("subway") == "yes":
+        return "metro"
+    if tags.get("amenity") == "school":
+        return "schools"
+    if tags.get("amenity") == "kindergarten":
+        return "kindergartens"
+    if tags.get("amenity") == "hospital" or tags.get("healthcare") == "hospital":
+        return "hospitals"
+    return None
+
+
+def _dedup(items: list[tuple], same_name_km: float, any_km: float) -> list[tuple]:
+    kept: list[tuple] = []
+    for lat, lon, name in items:
+        n = (name or "").strip().lower()
+        if not any(_hav(lat, lon, la, lo) < any_km or (n and n == nm and _hav(lat, lon, la, lo) < same_name_km)
+                   for la, lo, nm in kept):
+            kept.append((lat, lon, n))
+    return kept
+
+
+def parse_overpass(data: dict, bbox: tuple) -> dict:
+    """Overpass JSON -> {'schools': [[lat, lon], ...], ..., 'metro_names': [...]} with duplicates removed."""
+    found: dict[str, list[tuple]] = {c: [] for c in CATEGORIES}
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        cat = _category(tags)
+        if cat is None:
+            continue
+        if "lat" in el and "lon" in el:
+            lat, lon = el["lat"], el["lon"]
+        elif isinstance(el.get("center"), dict):
+            lat, lon = el["center"]["lat"], el["center"]["lon"]
+        else:
+            continue
+        found[cat].append((float(lat), float(lon), tags.get("name:ru") or tags.get("name") or ""))
+    poi: dict = {"source": "OpenStreetMap contributors (Overpass API), ODbL",
+                 "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "bbox": list(bbox)}
+    for cat in CATEGORIES:
+        kept = _dedup(found[cat], *DEDUP[cat])
+        poi[cat] = [[round(la, 6), round(lo, 6)] for la, lo, _ in kept]
+        if cat == "metro":
+            poi["metro_names"] = [nm for _, _, nm in kept]
+    if not poi["metro"]:
+        raise GeoError("No metro stations found in the Overpass response; refusing to build spatial features.")
+    return poi
+
+
+def fetch_poi(bbox: tuple, session=None, urls=OVERPASS_URLS, timeout: int = 180) -> dict:
+    """One Overpass query (second mirror as a fallback). Raises GeoError on failure."""
+    session = session or requests
+    query, last = overpass_query(bbox), "no response"
+    for url in urls:
+        try:
+            resp = session.post(url, data={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+            if resp.status_code == 200:
+                return parse_overpass(resp.json(), bbox)
+            last = f"HTTP {resp.status_code} from {url}"
+        except (requests.RequestException, ValueError) as exc:
+            last = f"{type(exc).__name__} from {url}"
+        log.warning("Overpass attempt failed: %s", last)
+    raise GeoError(f"Overpass request failed: {last}")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Spatial features: download POI and check coverage.")
+    ap.add_argument("--fetch", action="store_true", help="download POI from OpenStreetMap (one Overpass query)")
+    ap.add_argument("--check", action="store_true", help="show coverage and statistics of the spatial features")
+    ap.add_argument("--input", default=str(config.FALLBACK_CSV), help="dataset CSV with latitude/longitude")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+    df = storage.read_listings(__import__("pathlib").Path(args.input))
+    have = int((pd.to_numeric(df.get("latitude"), errors="coerce").notna()).sum()) if "latitude" in df else 0
+    print(f"Dataset: {len(df)} listings, {have} with coordinates ({100 * have / max(len(df), 1):.0f} %).")
+    if args.fetch:
+        if have == 0:
+            print("No coordinates yet: run  python -m backend.batch --enrich  first. Using the default Almaty area.")
+        bbox = bbox_for(df)
+        print(f"Querying OpenStreetMap (Overpass) once for the area {bbox} ...")
+        try:
+            poi = fetch_poi(bbox)
+        except GeoError as exc:
+            print(f"FAILED: {exc}")
+            return 1
+        storage.save_poi(poi)
+        print({k: len(poi[k]) for k in CATEGORIES})
+        print("Metro stations found:", ", ".join(n or "(unnamed)" for n in poi["metro_names"]))
+        print("Saved to data/cache/poi.json. Data (c) OpenStreetMap contributors (ODbL).")
+        return 0
+    poi = storage.load_poi()
+    if poi is None:
+        print("No POI file yet: run  python -m backend.geo --fetch")
+        return 1
+    feats = add_geo_features(df, poi)
+    print(feats[GEO_FEATURES].describe().round(2).to_string())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,150 @@
+"use strict";
+const $ = (id) => document.getElementById(id);
+const FIELDS = ["district", "area_total", "floor", "floor_total", "house_year", "building_type"];
+const SOURCES = {live: "Свежий парсинг", raw_cache: "Кэш страниц krisha.kz", offline_fallback: "Сохранённые данные"};
+let opts = {year_min: 1950, year_max: new Date().getFullYear() + 5, area_min: 10, area_max: 400};
+const nf = new Intl.NumberFormat("ru-RU", {maximumFractionDigits: 0});
+const nf1 = new Intl.NumberFormat("ru-RU", {maximumFractionDigits: 1});
+const kzt = (n) => (n == null ? "—" : nf.format(n) + "\u00a0₸");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  e.textContent = text == null || text === "" ? "—" : text;
+  if (cls) e.className = cls;
+  return e;
+}
+function setError(name, msg) {
+  const s = document.querySelector('[data-for="' + name + '"]');
+  if (s) s.textContent = msg || "";
+  const i = $(name);
+  if (i) { i.classList.toggle("invalid", !!msg); i.setAttribute("aria-invalid", msg ? "true" : "false"); }
+}
+function showAlert(msg, kind) {
+  const a = $("alert");
+  a.textContent = msg || "";
+  a.className = "alert" + (kind === "error" ? " error" : "");
+  a.hidden = !msg;
+  if (msg) $("result").hidden = false;
+}
+function setBusy(busy, msg) {
+  $("submit").disabled = busy;
+  $("submit").textContent = busy ? "Считаем…" : "Рассчитать стоимость";
+  $("status").textContent = msg || "";
+}
+function fillSelect(sel, values) {
+  sel.replaceChildren(new Option("Выберите…", ""), ...values.map((v) => new Option(v, v)));
+}
+
+async function loadOptions() {
+  try {
+    const r = await fetch("/api/options");
+    if (!r.ok) throw new Error(r.status);
+    opts = await r.json();
+    fillSelect($("district"), opts.districts);
+    fillSelect($("building_type"), opts.building_types);
+    $("area_total").min = opts.area_min; $("area_total").max = opts.area_max;
+    $("house_year").min = opts.year_min; $("house_year").max = opts.year_max;
+    $("house_year").placeholder = opts.year_min + "–" + opts.year_max;
+    $("floor").min = 1; $("floor_total").min = 1;
+  } catch (e) {
+    showAlert("Не удалось загрузить списки районов и типов домов. Проверьте, что сервер запущен, и обновите страницу.", "error");
+  }
+}
+
+function read() {
+  const n = (id) => ($(id).value.trim() === "" ? NaN : Number($(id).value));
+  return {district: $("district").value, area_total: n("area_total"), floor: n("floor"),
+          floor_total: n("floor_total"), house_year: n("house_year"), building_type: $("building_type").value};
+}
+function validate(v) {   // mirrors the API rules
+  const e = {};
+  if (!v.district) e.district = "Выберите район.";
+  if (!Number.isFinite(v.area_total)) e.area_total = "Введите общую площадь.";
+  else if (v.area_total < opts.area_min || v.area_total > opts.area_max)
+    e.area_total = "Площадь должна быть от " + opts.area_min + " до " + opts.area_max + " м².";
+  if (!Number.isInteger(v.floor) || v.floor < 1) e.floor = "Введите этаж: целое число от 1.";
+  if (!Number.isInteger(v.floor_total) || v.floor_total < 1) e.floor_total = "Введите этажность: целое число от 1.";
+  else if (!e.floor && v.floor > v.floor_total)
+    e.floor_total = "Этаж (" + v.floor + ") не может быть больше этажности дома (" + v.floor_total + ").";
+  if (!Number.isInteger(v.house_year) || v.house_year < opts.year_min || v.house_year > opts.year_max)
+    e.house_year = "Год постройки должен быть от " + opts.year_min + " до " + opts.year_max + ".";
+  if (!v.building_type) e.building_type = "Выберите тип дома.";
+  return e;
+}
+
+function render(d) {
+  showAlert("");
+  $("result").hidden = false;
+  $("output").hidden = false;
+  $("price").textContent = kzt(d.price_estimate_kzt);
+  $("low").textContent = "от " + kzt(d.price_low_kzt);
+  $("high").textContent = "до " + kzt(d.price_high_kzt);
+  const span = d.price_high_kzt - d.price_low_kzt;
+  const pos = span > 0 ? ((d.price_estimate_kzt - d.price_low_kzt) / span) * 100 : 50;
+  $("marker").style.left = Math.min(100, Math.max(0, pos)) + "%";
+  $("ppm2").textContent = kzt(d.price_per_m2_kzt);
+  $("median").textContent = kzt(d.district_median_price_per_m2_kzt);
+  const p = d.vs_district_median_pct, diff = $("diff");
+  diff.textContent = p == null ? "—" : (p > 0 ? "+" : p < 0 ? "−" : "") + nf1.format(Math.abs(p)) + " %";
+  diff.className = p > 0 ? "up" : p < 0 ? "down" : "";
+  const badge = $("badge");
+  badge.textContent = SOURCES[d.data_source] || d.data_source;
+  badge.className = "badge" + (d.data_source === "live" ? " live" : "");
+  $("rows").textContent = nf.format(d.rows_used) + " объявлений в базе" +
+    (d.data_collected_from ? ", собраны " + d.data_collected_from + " – " + d.data_collected_to : "");
+  $("warnings").replaceChildren(...(d.warnings || []).map((w) => el("li", w)));
+  $("comps").replaceChildren(...d.comparables.map((c) => {
+    const tr = document.createElement("tr");
+    const link = el("td", "");
+    if (c.url && c.url.startsWith("https://krisha.kz/")) {
+      const a = el("a", "Открыть");
+      a.href = c.url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      link.replaceChildren(a);
+    }
+    tr.append(el("td", kzt(c.price_kzt)), el("td", c.area_total == null ? null : nf1.format(c.area_total) + " м²"),
+      el("td", c.floor && c.floor_total ? c.floor + "/" + c.floor_total : null), el("td", c.house_year),
+      el("td", c.district), link);
+    return tr;
+  }));
+  const m = d.model_metrics || {};
+  $("quality").textContent = m.mape == null ? "" :
+    "Типичная ошибка модели около " + Math.round(m.mape) + " % (" + m.evaluation + "): реальная цена может заметно отличаться." +
+    (m.beats_baseline ? "" : " Модель не лучше простой оценки по району.");
+  if (window.matchMedia("(max-width: 760px)").matches) $("result").scrollIntoView();
+}
+
+async function submit(ev) {
+  ev.preventDefault();
+  FIELDS.forEach((f) => setError(f, ""));
+  showAlert("");
+  const v = read(), errs = validate(v), bad = FIELDS.filter((f) => errs[f]);
+  bad.forEach((f) => setError(f, errs[f]));
+  if (bad.length) { $(bad[0]).focus(); return; }
+  setBusy(true);
+  try {
+    for (let i = 0; i < 12; i++) {
+      const r = await fetch("/api/predict", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(v)});
+      const data = await r.json().catch(() => ({}));
+      if (r.status === 503 && i < 11 && /обучается/.test(data.message || "")) {
+        setBusy(true, "Модель обучается, подождите несколько секунд…");
+        await sleep((Number(r.headers.get("Retry-After")) || 5) * 1000);
+        continue;
+      }
+      if (r.ok) { render(data); return; }
+      if (r.status === 422 && Array.isArray(data.detail)) data.detail.forEach((d) => setError(d.field, d.message));
+      $("output").hidden = true;
+      showAlert(data.message || "Не удалось получить оценку. Попробуйте ещё раз.", "error");
+      return;
+    }
+  } catch (e) {
+    $("output").hidden = true;
+    showAlert("Нет связи с сервером. Проверьте, что он запущен, и повторите.", "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+$("form").addEventListener("submit", submit);
+FIELDS.forEach((f) => $(f).addEventListener("input", () => setError(f, "")));
+loadOptions();
