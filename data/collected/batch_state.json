@@ -1,0 +1,176 @@
+{
+  "updated_at": "2026-10-14T05:50:35+00:00",
+  "next_page": 83,
+  "runs": [
+    {
+      "at": "2026-10-03T11:12:45+00:00",
+      "start_page": 1,
+      "pages": 5,
+      "added": 70,
+      "reason": "batch_size_reached"
+    },
+    {
+      "at": "2026-10-03T11:17:33+00:00",
+      "start_page": 4,
+      "pages": 5,
+      "added": 14,
+      "reason": "no_new_listings"
+    },
+    {
+      "at": "2026-10-03T11:19:23+00:00",
+      "start_page": 10,
+      "pages": 5,
+      "added": 70,
+      "reason": "batch_size_reached"
+    },
+    {
+      "at": "2026-10-05T05:47:16+00:00",
+      "start_page": 15,
+      "pages": 4,
+      "added": 70,
+      "reason": "batch_size_reached"
+    },
+    {
+      "at": "2026-10-05T05:48:03+00:00",
+      "start_page": 20,
+      "pages": 4,
+      "added": 70,
+      "reason": "batch_size_reached"
+    },
+    {
+      "at": "2026-10-05T08:21:25+00:00",
+      "start_page": 25,
+      "pages": 5,
+      "added": 64,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-05T08:25:12+00:00",
+      "start_page": 30,
+      "pages": 5,
+      "added": 60,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-05T08:29:24+00:00",
+      "start_page": 35,
+      "pages": 5,
+      "added": 33,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-05T08:32:03+00:00",
+      "start_page": 40,
+      "pages": 5,
+      "added": 49,
+      "reason": "target_reached"
+    },
+    {
+      "at": "2026-10-10T20:47:26+00:00",
+      "kind": "enrich",
+      "added": 0,
+      "missing": 9,
+      "reason": "interrupted"
+    },
+    {
+      "at": "2026-10-10T20:48:04+00:00",
+      "kind": "enrich",
+      "added": 0,
+      "missing": 1,
+      "reason": "interrupted"
+    },
+    {
+      "at": "2026-10-10T20:50:11+00:00",
+      "kind": "enrich",
+      "added": 0,
+      "missing": 4,
+      "reason": "interrupted"
+    },
+    {
+      "at": "2026-10-12T10:22:53+00:00",
+      "kind": "enrich",
+      "added": 0,
+      "missing": 0,
+      "reason": "blocked"
+    },
+    {
+      "at": "2026-10-13T16:45:14+00:00",
+      "start_page": 43,
+      "pages": 4,
+      "added": 70,
+      "reason": "batch_size_reached"
+    },
+    {
+      "at": "2026-10-13T16:46:12+00:00",
+      "start_page": 45,
+      "pages": 5,
+      "added": 46,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-13T16:47:01+00:00",
+      "start_page": 49,
+      "pages": 5,
+      "added": 58,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-14T04:35:16+00:00",
+      "start_page": 53,
+      "pages": 5,
+      "added": 65,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-14T04:37:10+00:00",
+      "start_page": 57,
+      "pages": 5,
+      "added": 48,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-14T05:01:15+00:00",
+      "start_page": 61,
+      "pages": 5,
+      "added": 22,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-14T05:03:53+00:00",
+      "start_page": 65,
+      "pages": 5,
+      "added": 40,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-14T05:25:08+00:00",
+      "start_page": 69,
+      "pages": 5,
+      "added": 65,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-14T05:26:51+00:00",
+      "start_page": 73,
+      "pages": 3,
+      "added": 0,
+      "reason": "no_new_listings"
+    },
+    {
+      "at": "2026-10-14T05:27:33+00:00",
+      "start_page": 75,
+      "pages": 5,
+      "added": 37,
+      "reason": "max_pages_reached"
+    },
+    {
+      "at": "2026-10-14T05:50:35+00:00",
+      "start_page": 79,
+      "pages": 5,
+      "added": 49,
+      "reason": "target_reached"
+    }
+  ],
+  "no_coords": [],
+  "blocked_until": 1791822173.244538
+}
